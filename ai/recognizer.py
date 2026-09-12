@@ -1,75 +1,117 @@
 import os
-import cv2
-import numpy as np
 import logging
+import numpy as np
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-PROFILE_DIR = Path(os.environ.get("USERPROFILE", ".")) / ".sentinelface" / "enroll"
-ALT_PROFILE_DIR = Path(os.environ.get("USERPROFILE", ".")) / ".face-unlock" / "enroll"
+APPDATA_DIR = Path(os.environ.get("USERPROFILE", ".")) / ".sentinelface"
+EMBEDDINGS_FILE = APPDATA_DIR / "embeddings.enc"
+EMBEDDINGS_META = APPDATA_DIR / "embeddings.meta"
+
+
+class RecognitionError(Exception):
+    """Raised when the recognition backend itself cannot be trusted to give an
+    answer (import failure, model crash, corrupted profile, etc).
+
+    Callers MUST treat this as a FAILED verification, never as an automatic
+    pass. The previous version of this file did the opposite: if DeepFace
+    failed to import or crashed for any reason, it fell back to "any face
+    detected = match", which meant a stranger's face would pass whenever the
+    ML backend hiccuped. That is a fail-open bug in a security tool and is
+    the single most important thing fixed in this rewrite.
+    """
+    pass
+
 
 class FaceRecognizer:
-    def __init__(self, threshold: float = 0.45, model_name: str = "ArcFace"):
-        self.threshold = threshold
+    def __init__(self, threshold: float = 0.60, model_name: str = "ArcFace",
+                 min_agreement: int = 2):
+        self.threshold = threshold          # cosine distance; LOWER = stricter
         self.model_name = model_name
+        self.min_agreement = min_agreement  # how many enrolled samples must independently agree
+        self._enrolled_embeddings = None
 
-    def get_enrolled_images(self) -> list:
-        targets = []
-        for p_dir in [PROFILE_DIR, ALT_PROFILE_DIR]:
-            if p_dir.exists():
-                imgs = list(p_dir.glob("*.jpg")) + list(p_dir.glob("*.png"))
-                if imgs:
-                    targets.extend([str(p) for p in imgs])
-        return targets
+    # ---------- enrollment storage ----------
 
     def is_enrolled(self) -> bool:
-        return len(self.get_enrolled_images()) > 0
+        return EMBEDDINGS_FILE.exists() and EMBEDDINGS_META.exists()
 
-    def verify_frame(self, frame: np.ndarray) -> tuple:
-        """
-        Verifies frame against enrolled face photos.
-        Returns: (match: bool, distance: float, is_real: bool)
-        """
-        enrolled_files = self.get_enrolled_images()
-        if not enrolled_files:
-            log.warning("No enrolled face profiles found.")
-            return False, 1.0, False
+    def _load_embeddings(self) -> list:
+        if self._enrolled_embeddings is not None:
+            return self._enrolled_embeddings
+        if not self.is_enrolled():
+            return []
+        from core.crypto import DPAPICrypto
+        try:
+            dim = int(EMBEDDINGS_META.read_text().strip())
+            decrypted = DPAPICrypto.decrypt_data(EMBEDDINGS_FILE.read_bytes())
+            arr = np.frombuffer(decrypted, dtype=np.float64).reshape(-1, dim)
+            self._enrolled_embeddings = [row for row in arr]
+        except Exception as e:
+            log.error(f"Failed to load/decrypt enrolled face profile: {e}")
+            self._enrolled_embeddings = []
+        return self._enrolled_embeddings
 
+    def save_embeddings(self, embeddings: list):
+        from core.crypto import DPAPICrypto
+        arr = np.array(embeddings, dtype=np.float64)
+        APPDATA_DIR.mkdir(parents=True, exist_ok=True)
+        EMBEDDINGS_META.write_text(str(arr.shape[1]))
+        EMBEDDINGS_FILE.write_bytes(DPAPICrypto.encrypt_data(arr.tobytes()))
+        self._enrolled_embeddings = list(arr)
+        log.info(f"Saved {len(embeddings)} encrypted face embeddings to {EMBEDDINGS_FILE}.")
+
+    # ---------- inference ----------
+
+    def compute_embedding(self, frame: np.ndarray):
+        """Returns an embedding vector for the given frame, or None if no
+        usable face is found in THIS frame (that's normal, not an error).
+        Raises RecognitionError only for genuine backend failure - callers
+        must fail closed on that, not fall back to a pass."""
         try:
             from deepface import DeepFace
-            # Save temporary frame for verification
-            temp_path = Path("E:/SentinelFace/temp_verify.jpg")
-            cv2.imwrite(str(temp_path), frame)
-
-            best_distance = 1.0
-            matched = False
-
-            # Test against top enrolled reference images
-            for ref_img in enrolled_files[:3]:
-                res = DeepFace.verify(
-                    img1_path=str(temp_path),
-                    img2_path=ref_img,
-                    model_name=self.model_name,
-                    distance_metric="cosine",
-                    enforce_detection=False
-                )
-                dist = res.get("distance", 1.0)
-                if dist < best_distance:
-                    best_distance = dist
-                if res.get("verified", False) or dist <= self.threshold:
-                    matched = True
-                    break
-
-            if temp_path.exists():
-                temp_path.unlink()
-
-            return matched, best_distance, True
-
         except Exception as e:
-            log.warning(f"DeepFace verification fallback: {e}")
-            # Fallback face presence check
-            from ai.detector import FaceDetector
-            det = FaceDetector()
-            has_face = det.has_face(frame)
-            return has_face, 0.35 if has_face else 1.0, True
+            raise RecognitionError(f"face recognition backend unavailable ({e})")
+        try:
+            reps = DeepFace.represent(
+                img_path=frame,
+                model_name=self.model_name,
+                enforce_detection=True,
+                detector_backend="opencv",
+            )
+            if not reps:
+                return None
+            return np.array(reps[0]["embedding"], dtype=np.float64)
+        except ValueError:
+            # DeepFace raises ValueError when it simply can't find a face -
+            # that's a "no face this frame" case, not a backend failure.
+            return None
+        except RecognitionError:
+            raise
+        except Exception as e:
+            raise RecognitionError(f"embedding extraction failed ({e})")
+
+    @staticmethod
+    def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+        a = a / (np.linalg.norm(a) + 1e-9)
+        b = b / (np.linalg.norm(b) + 1e-9)
+        return float(1.0 - np.dot(a, b))
+
+    def verify_embedding(self, embedding: np.ndarray) -> tuple:
+        """
+        Compares one probe embedding against every enrolled embedding.
+        Returns (matched, best_distance, num_agreeing).
+
+        matched requires at least `min_agreement` enrolled samples to
+        independently fall within threshold - a single near-miss embedding
+        can no longer flip a whole verification, unlike the original
+        "break on first match against the first 3 files" logic.
+        """
+        enrolled = self._load_embeddings()
+        if not enrolled:
+            return False, 1.0, 0
+        distances = sorted(self._cosine_distance(embedding, e) for e in enrolled)
+        num_agreeing = sum(1 for d in distances if d <= self.threshold)
+        matched = num_agreeing >= min(self.min_agreement, len(enrolled))
+        return matched, distances[0], num_agreeing

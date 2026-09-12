@@ -2,34 +2,26 @@ import logging
 
 log = logging.getLogger(__name__)
 
-class ToastNotifier:
-    """Delivers native Windows Toast Notifications for SentinelFace events."""
+_icon_ref = {"icon": None}
 
-    @staticmethod
-    def notify_pass(confidence: float, matches_str: str):
-        try:
-            from winotify import Notification, audio
-            toast = Notification(
-                app_id="SentinelFace",
-                title="🛡️ SentinelFace: User Verified",
-                msg=f"Identity confirmed ({confidence:.1f}% match, {matches_str} frames). Continuing session...",
-                duration="short"
-            )
-            toast.show()
-        except Exception as e:
-            log.debug(f"Toast notification skipped: {e}")
 
-    @staticmethod
-    def notify_lock(reason: str = "User Absent / Unrecognized"):
+def set_tray_icon(icon):
+    """Called once by tray.py after the pystray icon is created, so notify()
+    can use its native balloon/toast on Windows."""
+    _icon_ref["icon"] = icon
+
+
+def notify(title: str, message: str):
+    """Best-effort desktop notification. Uses the tray icon's native balloon
+    (pystray -> Windows Shell notification) if the tray app is running;
+    otherwise just logs. This is intentionally modest - a previous version
+    of this project claimed a fully native toast pipeline that was never
+    actually wired up in the code."""
+    icon = _icon_ref.get("icon")
+    if icon is not None:
         try:
-            from winotify import Notification, audio
-            toast = Notification(
-                app_id="SentinelFace",
-                title="🔒 SentinelFace: Locking PC",
-                msg=f"Security alert: {reason}. Windows screen locked.",
-                duration="short"
-            )
-            toast.set_audio(audio.Hand, loop=False)
-            toast.show()
+            icon.notify(message, title)
+            return
         except Exception as e:
-            log.debug(f"Toast notification skipped: {e}")
+            log.debug(f"Tray notification failed, falling back to log only: {e}")
+    log.info(f"[NOTIFY] {title}: {message}")

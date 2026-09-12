@@ -1,5 +1,8 @@
 @echo off
 title SentinelFace Dashboard
-echo Opening SentinelFace Security Dashboard...
-cd /d "E:\SentinelFace"
-"E:\windows-face-unlock\.venv\Scripts\python.exe" main.py --dashboard
+cd /d "%~dp0"
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" main.py --dashboard
+) else (
+    python main.py --dashboard
+)

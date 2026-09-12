@@ -3,9 +3,10 @@ import logging
 
 log = logging.getLogger(__name__)
 
-def lock_windows_screen():
-    """Triggers standard Windows LockScreen (Win + L / LockWorkStation)."""
-    log.warning("SentinelFace Action: Triggering Windows LockWorkStation()...")
+
+def lock_windows_screen() -> bool:
+    """Triggers the standard Windows lock screen (equivalent to Win+L)."""
+    log.warning("SentinelFace: triggering LockWorkStation()...")
     try:
         ctypes.windll.user32.LockWorkStation()
         return True

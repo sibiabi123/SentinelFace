@@ -1,19 +1,30 @@
 import json
 import logging
 from pathlib import Path
+
 from camera.webcam import WebcamManager
 from ai.detector import FaceDetector
-from ai.recognizer import FaceRecognizer
+from ai.recognizer import FaceRecognizer, RecognitionError
 from ai.liveness import LivenessAnalyzer
 from database.db import AuditDatabase
 from core.locker import lock_windows_screen
-from core.notifications import ToastNotifier
+from core.notifications import notify
 
 log = logging.getLogger(__name__)
-CONFIG_PATH = Path("E:/SentinelFace/config.json")
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = BASE_DIR / "config.json"
+
 
 class VerificationEngine:
-    """Orchestrates multi-frame capture, lighting normalization, face verification, database logging, toast alerts, and locking."""
+    """Orchestrates capture -> normalize -> recognize -> liveness -> log -> lock/continue.
+
+    Two behavioral changes from the original that matter for security:
+      1. A recognition backend failure (RecognitionError) is treated as a
+         FAILED check, not skipped or passed. Fail closed, not open.
+      2. The liveness score is now actually used to gate the PASS decision.
+         Previously it was computed and logged but never checked.
+    """
 
     def __init__(self, db: AuditDatabase = None):
         self.db = db or AuditDatabase()
@@ -22,106 +33,95 @@ class VerificationEngine:
         self.load_config()
 
     def load_config(self):
-        if CONFIG_PATH.exists():
-            try:
-                with open(CONFIG_PATH, "r") as f:
-                    self.config = json.load(f)
-            except Exception:
-                self.config = {}
-        else:
+        try:
+            self.config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+        except Exception:
             self.config = {}
-
-        self.threshold = self.config.get("confidence_threshold", 0.45)
+        self.threshold = self.config.get("confidence_threshold", 0.60)
         self.verify_frames = self.config.get("verify_frames", 10)
         self.verify_required = self.config.get("verify_required", 6)
+        self.min_agreement = self.config.get("min_agreement", 2)
         self.camera_index = self.config.get("camera_index", 0)
         self.auto_lock = self.config.get("auto_lock_enabled", True)
-        self.show_toasts = self.config.get("show_toast_notifications", True)
-
-        self.recognizer = FaceRecognizer(threshold=self.threshold)
+        self.liveness_required = self.config.get("liveness_required", True)
+        self.recognizer = FaceRecognizer(threshold=self.threshold, min_agreement=self.min_agreement)
         self.webcam = WebcamManager(camera_index=self.camera_index)
+        self.liveness.min_pass_score = self.config.get("liveness_min_score", 0.55)
+
+    def _deny(self, result, notes, matches="0/0", confidence=0.0, liveness=0.0, is_manual_check=False):
+        action = "LOCK_TRIGGERED" if (self.auto_lock and not is_manual_check) else "NONE"
+        self.db.log_attempt(result=result, confidence=confidence, liveness=liveness,
+                             matches=matches, action=action, notes=notes)
+        if action == "LOCK_TRIGGERED":
+            lock_windows_screen()
+            notify("SentinelFace", "Face not verified — Windows locked.")
+        return {"status": result, "message": notes, "confidence": confidence,
+                "liveness": liveness, "matches": matches, "action": action}
 
     def run_verification(self, is_manual_check: bool = False) -> dict:
         self.load_config()
-        log.info(f"--- Running SentinelFace Verification Probe (Target: {self.verify_required}/{self.verify_frames} matches) ---")
 
         if not self.recognizer.is_enrolled():
-            msg = "No enrolled face profile found. Please enroll face first!"
+            msg = "No enrolled face profile found. Please enroll first."
             log.warning(msg)
             self.db.log_attempt("ERROR", 0.0, 0.0, "0/0", "NONE", msg)
             return {"status": "ERROR", "message": msg}
 
         frames = self.webcam.capture_frames(num_frames=self.verify_frames)
         if not frames:
-            msg = "Webcam unavailable or blocked by another application."
-            log.error(msg)
-            self.db.log_attempt("ABSENT", 1.0, 0.0, f"0/{self.verify_frames}", "LOCK_TRIGGERED" if self.auto_lock else "NONE", msg)
-            if self.show_toasts and not is_manual_check:
-                ToastNotifier.notify_lock("Webcam Unavailable / Blocked")
-            if self.auto_lock and not is_manual_check:
-                lock_windows_screen()
-            return {"status": "ABSENT", "message": msg}
+            return self._deny("ABSENT", "Webcam unavailable or no frames captured.",
+                               is_manual_check=is_manual_check)
 
-        # Multi-frame majority voting pipeline
-        matched_count = 0
-        distances = []
         valid_frames = []
+        matched_count = 0
+        best_distances = []
+        try:
+            for frame in frames:
+                norm = self.detector.normalize_lighting(frame)
+                if self.detector.is_blurry(norm):
+                    continue
+                valid_frames.append(norm)
+                embedding = self.recognizer.compute_embedding(norm)
+                if embedding is None:
+                    continue  # simply no face in this particular frame
+                matched, dist, _ = self.recognizer.verify_embedding(embedding)
+                best_distances.append(dist)
+                if matched:
+                    matched_count += 1
+        except RecognitionError as e:
+            # FAIL CLOSED. This is the fix for the original's most serious bug:
+            # it used to fall back to "any detected face = match" here.
+            log.error(f"Recognition backend failure - failing closed: {e}")
+            return self._deny("ERROR", f"Recognition backend error, treated as failed verification: {e}",
+                               is_manual_check=is_manual_check)
 
-        for frame in frames:
-            norm_frame = self.detector.normalize_lighting(frame)
-            if self.detector.is_blurry(norm_frame):
-                continue
-            valid_frames.append(norm_frame)
+        if not valid_frames:
+            return self._deny("ABSENT", "No usable (non-blurry) frames captured.",
+                               is_manual_check=is_manual_check)
 
-            matched, dist, _ = self.recognizer.verify_frame(norm_frame)
-            distances.append(dist)
-            if matched:
-                matched_count += 1
-
-        avg_distance = sum(distances) / len(distances) if distances else 1.0
+        liveness_result = self.liveness.evaluate(valid_frames)
+        liveness_score = liveness_result["score"]
+        avg_distance = sum(best_distances) / len(best_distances) if best_distances else 1.0
         confidence_pct = max(0.0, min(100.0, (1.0 - avg_distance) * 100.0))
-        liveness_score = self.liveness.evaluate_liveness(valid_frames if valid_frames else frames)
-
         match_str = f"{matched_count}/{len(frames)}"
-        passed = matched_count >= self.verify_required
+
+        identity_ok = matched_count >= self.verify_required
+        liveness_ok = liveness_result["passed"] if self.liveness_required else True
+        passed = identity_ok and liveness_ok
 
         if passed:
-            result = "PASS"
-            action = "CONTINUE"
-            log.info(f"VERIFICATION SUCCESSFUL: Matched {match_str} frames (Confidence: {confidence_pct:.1f}%). User verified!")
-            if self.show_toasts and not is_manual_check:
-                ToastNotifier.notify_pass(confidence_pct, match_str)
-        else:
-            result = "FAIL" if len(valid_frames) > 0 else "ABSENT"
-            action = "LOCK_TRIGGERED" if (self.auto_lock and not is_manual_check) else "NONE"
-            log.warning(f"VERIFICATION FAILED: Matched {match_str} frames. Action: {action}")
-            if self.show_toasts and not is_manual_check:
-                ToastNotifier.notify_lock(f"Unrecognized Face / User Absent ({match_str} matches)")
+            self.db.log_attempt(result="PASS", confidence=confidence_pct, liveness=liveness_score,
+                                 matches=match_str, action="CONTINUE",
+                                 notes="Manual check" if is_manual_check else "Scheduled check")
+            log.info(f"VERIFICATION PASSED: {match_str} matched, confidence={confidence_pct:.1f}%, liveness={liveness_score}")
+            return {"status": "PASS", "confidence": confidence_pct, "liveness": liveness_score,
+                    "matches": match_str, "action": "CONTINUE"}
 
-        self.db.log_attempt(
-            result=result,
-            confidence=confidence_pct,
-            liveness=liveness_score,
-            matches=match_str,
-            action=action,
-            notes="Manual check" if is_manual_check else "Scheduled check"
-        )
-
-        if passed:
-            return {
-                "status": "PASS",
-                "confidence": confidence_pct,
-                "liveness": liveness_score,
-                "matches": match_str,
-                "action": action
-            }
-        else:
-            if self.auto_lock and not is_manual_check:
-                lock_windows_screen()
-            return {
-                "status": result,
-                "confidence": confidence_pct,
-                "liveness": liveness_score,
-                "matches": match_str,
-                "action": action
-            }
+        reasons = []
+        if not identity_ok:
+            reasons.append("face did not match enrolled profile")
+        if not liveness_ok:
+            reasons.append("liveness check failed (looked static/photo-like)")
+        return self._deny("FAIL", "; ".join(reasons) or "verification failed", matches=match_str,
+                           confidence=confidence_pct, liveness=liveness_score,
+                           is_manual_check=is_manual_check)

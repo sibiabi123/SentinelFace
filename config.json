@@ -1,15 +1,14 @@
 {
   "app_name": "SentinelFace",
-  "version": "1.0.0",
-  "presence_interval_s": 120,
-  "confidence_threshold": 0.45,
+  "version": "2.0.0",
+  "presence_interval_s": 900,
+  "confidence_threshold": 0.60,
   "verify_frames": 10,
-  "verify_required": 3,
+  "verify_required": 6,
+  "min_agreement": 2,
   "camera_index": 0,
   "camera_warmup_frames": 5,
-  "persistent_camera": false,
-  "anti_spoofing": false,
-  "show_toast_notifications": true,
-  "presence_mode": "recognition",
+  "liveness_required": true,
+  "liveness_min_score": 0.55,
   "auto_lock_enabled": true
 }

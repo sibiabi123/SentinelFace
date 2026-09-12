@@ -1,6 +1,8 @@
 @echo off
-title SentinelFace System Tray & Scheduler
-echo Starting SentinelFace Continuous Authentication...
-cd /d "E:\SentinelFace"
-"E:\windows-face-unlock\.venv\Scripts\python.exe" main.py
-pause
+title SentinelFace Tray & Scheduler
+cd /d "%~dp0"
+if exist ".venv\Scripts\pythonw.exe" (
+    start "" ".venv\Scripts\pythonw.exe" main.py
+) else (
+    start "" pythonw main.py
+)
