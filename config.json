@@ -1,8 +1,8 @@
 {
   "app_name": "SentinelFace",
   "version": "2.0.0",
-  "presence_interval_s": 900,
-  "confidence_threshold": 0.60,
+  "presence_interval_s": 120,
+  "confidence_threshold": 0.6,
   "verify_frames": 10,
   "verify_required": 6,
   "min_agreement": 2,
