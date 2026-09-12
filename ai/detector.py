@@ -4,14 +4,23 @@ import logging
 
 log = logging.getLogger(__name__)
 
+def _get_cascade_classifier():
+    try:
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        if hasattr(cv2, 'CascadeClassifier'):
+            return cv2.CascadeClassifier(cascade_path)
+        else:
+            return getattr(cv2, 'CascadeClassifier')(cascade_path)
+    except Exception as e:
+        log.error(f"Failed to load OpenCV CascadeClassifier: {e}")
+        return None
 
 class FaceDetector:
     """Preprocesses camera frames with CLAHE contrast enhancement and detects
-    faces using an OpenCV Haar cascade. This part of the original design was
-    sound and is kept largely as-is."""
+    faces using an OpenCV Haar cascade."""
 
     def __init__(self):
-        self.cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        self.cascade = _get_cascade_classifier()
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     def normalize_lighting(self, frame: np.ndarray) -> np.ndarray:
@@ -25,14 +34,14 @@ class FaceDetector:
 
     def is_blurry(self, frame: np.ndarray, threshold: float = 30.0) -> bool:
         """Laplacian-variance blur check. Blurry frames are skipped rather
-        than fed into recognition, since a bad frame is worse than no frame."""
+        than fed into recognition."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         score = cv2.Laplacian(gray, cv2.CV_64F).var()
         return score < threshold
 
     def detect_faces(self, frame: np.ndarray) -> list:
         """Returns bounding boxes [(x, y, w, h)] for all faces in frame."""
-        if frame is None:
+        if frame is None or self.cascade is None:
             return []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self.cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))

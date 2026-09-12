@@ -1,8 +1,11 @@
 @echo off
-title SentinelFace Tray & Scheduler
+title SentinelFace System Tray & Scheduler
 cd /d "%~dp0"
-if exist ".venv\Scripts\pythonw.exe" (
-    start "" ".venv\Scripts\pythonw.exe" main.py
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" main.py
+) else if exist "E:\windows-face-unlock\.venv\Scripts\python.exe" (
+    "E:\windows-face-unlock\.venv\Scripts\python.exe" main.py
 ) else (
-    start "" pythonw main.py
+    python main.py
 )
+pause
