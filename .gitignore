@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# User Sensitive Data & Logs
+*.db
+*.log
+temp_*.jpg
+user_face.jpg
+enroll/
+*.bin
+*.npz
+
+# IDE & System
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
